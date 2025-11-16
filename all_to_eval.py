@@ -1,4 +1,3 @@
-# /root/autodl-tmp/batch_process.py
 import cv2
 import torch
 import numpy as np
@@ -13,33 +12,68 @@ from types import SimpleNamespace
 from custom_byte_tracker import ByteTracker, STrack
 
 # ==============================================================================
-# 1. 导入 Metric3D 模块
+# 1. 导入 Metric3D 模块（修复路径问题）
 # ==============================================================================
 print(">>> [DEBUG] 步骤 1: 导入 Metric3D 模块...")
-METRIC3D_PATH = r'C:\Users\Administrator\Desktop\autodl-tmp (1)\Metric3D'
+# 修正：使用 Linux 环境下的相对路径（根据代码中其他路径推测 Metric3D 在 autodl-tmp1 下）
+METRIC3D_PATH = '/root/autodl-tmp/Metric3D'  # 绝对路径（推荐，避免歧义）
+# 或者使用相对路径（如果脚本在 autodl-tmp 目录下）：
+# METRIC3D_PATH = os.path.join(os.path.dirname(__file__), 'autodl-tmp1', 'Metric3D')
+
+# 验证路径是否存在
+if not os.path.exists(METRIC3D_PATH):
+    print(f"!!! [WARNING] Metric3D 路径不存在: {METRIC3D_PATH}")
+    print(">>> [DEBUG] 尝试自动查找 Metric3D 目录...")
+    # 尝试在 autodl-tmp1 下查找 Metric3D
+    possible_paths = glob.glob('/root/autodl-tmp/**/Metric3D', recursive=True)
+    if possible_paths:
+        METRIC3D_PATH = possible_paths[0]
+        print(f">>> [DEBUG] 找到 Metric3D 路径: {METRIC3D_PATH}")
+    else:
+        raise FileNotFoundError("Metric3D 目录未找到，请检查路径配置")
+
+# 添加路径到系统环境变量
 if METRIC3D_PATH not in sys.path:
     sys.path.insert(0, METRIC3D_PATH)
+    print(f">>> [DEBUG] 已添加 Metric3D 路径到 sys.path: {METRIC3D_PATH}")
+
 try:
     from mono.model.monodepth_model import DepthModel as MonoDepthModel
-
     print(">>> [INFO] Metric3D 模块导入成功。")
 except ImportError as e:
     print(f"!!! [ERROR] 从 Metric3D 导入模块失败: {e}")
+    print(">>> [DEBUG] 检查 Metric3D 目录结构是否如下：")
+    print("Metric3D/")
+    print("  └── mono/")
+    print("      └── model/")
+    print("          └── monodepth_model.py")
     raise
 
 # ==============================================================================
 # 2. 配置与路径定义
 # ==============================================================================
 print("\n>>> [DEBUG] 步骤 2: 配置模型和文件路径...")
-YOLO_MODEL_PATH = r'C:\Users\Administrator\Desktop\autodl-tmp (1)\weights\epoch30.pt'
-METRIC3D_MODEL_PATH = r'C:\Users\Administrator\Desktop\autodl-tmp (1)\weights\metric_depth_vit_large_800k.pth'
-METRIC3D_CONFIG_PATH = r'C:\Users\Administrator\Desktop\autodl-tmp (1)\Metric3D\mono\configs\HourglassDecoder\vit.raft5.large.py'
-INPUT_VIDEOS_DIR = r'C:\Users\Administrator\Desktop\autodl-tmp (1)\kitti_videos'  # <-- MAKE SURE THIS PATH IS CORRECT
-OUTPUT_EVAL_DIR = r'C:\Users\Administrator\Desktop\autodl-tmp (1)\eval_outputs3'
+YOLO_MODEL_PATH = '/root/autodl-tmp/weights/epoch30.pt'  # 使用绝对路径避免歧义
+METRIC3D_MODEL_PATH = '/root/autodl-tmp/weights/metric_depth_vit_large_800k.pth'
+METRIC3D_CONFIG_PATH = os.path.join(METRIC3D_PATH, 'mono/configs/HourglassDecoder/vit.raft5.large.py')
+INPUT_VIDEOS_DIR = '/root/autodl-tmp/kitti_videos'  # 绝对路径
+OUTPUT_EVAL_DIR = '/root/autodl-tmp/eval_outputs2'
+
+# 验证所有关键路径
+for path_name, path in [
+    ("YOLO 模型", YOLO_MODEL_PATH),
+    ("Metric3D 模型", METRIC3D_MODEL_PATH),
+    ("Metric3D 配置文件", METRIC3D_CONFIG_PATH),
+    ("输入视频目录", INPUT_VIDEOS_DIR)
+]:
+    if not (os.path.exists(path) or (os.path.isdir(path) and path_name.endswith("目录"))):
+        raise FileNotFoundError(f"{path_name} 路径不存在: {path}")
 
 os.makedirs(OUTPUT_EVAL_DIR, exist_ok=True)
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f">>> [INFO] 将要使用的设备: {DEVICE}")
+if torch.cuda.is_available():
+    print(f">>> [INFO] GPU 设备: {torch.cuda.get_device_name(0)}")
 
 # ==============================================================================
 # 3. 模型加载 (全局加载一次)
@@ -48,7 +82,10 @@ print("\n>>> [DEBUG] 步骤 3: 开始加载深度学习模型...")
 try:
     yolo_model = YOLO(YOLO_MODEL_PATH)
     TARGET_CLASS_NAME = 'Car'
-    TARGET_CLASS_ID = [k for k, v in yolo_model.names.items() if v == TARGET_CLASS_NAME][0]
+    TARGET_CLASS_ID = [k for k, v in yolo_model.names.items() if v == TARGET_CLASS_NAME]
+    if not TARGET_CLASS_ID:
+        raise ValueError(f"YOLO 模型中未找到类别 '{TARGET_CLASS_NAME}'，可用类别：{list(yolo_model.names.values())}")
+    TARGET_CLASS_ID = TARGET_CLASS_ID[0]
     print(f">>> [INFO] 目标类别 '{TARGET_CLASS_NAME}' ID为: {TARGET_CLASS_ID}")
 except Exception as e:
     print(f"!!! [ERROR] 加载 YOLOv8 模型失败: {e}")
@@ -67,26 +104,37 @@ except Exception as e:
     print(f"!!! [FATAL ERROR] 加载 Metric3Dv2 模型时出错: {e}")
     raise
 
-
 # ==============================================================================
 # 4. 视频处理主函数
 # ==============================================================================
 def process_video_for_eval(input_path, output_txt_path):
     print(f"\n--- 开始处理视频: {os.path.basename(input_path)} ---")
     cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"无法打开视频文件: {input_path}")
+    
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # 验证 cfg.data_basic 是否存在
+    if not hasattr(cfg, 'data_basic') or 'vit_size' not in cfg.data_basic:
+        raise AttributeError("配置文件中未找到 data_basic.vit_size，请检查 Metric3D 配置文件")
     metric3d_input_size = (cfg.data_basic['vit_size'][1], cfg.data_basic['vit_size'][0])
 
-    tracker_args = SimpleNamespace(track_high_thresh=0.5, track_low_thresh=0.1, new_track_thresh=0.6,
-                                   track_buffer=30, match_thresh=0.8, mot20=False)
+    tracker_args = SimpleNamespace(
+        track_high_thresh=0.5, 
+        track_low_thresh=0.1, 
+        new_track_thresh=0.6,
+        track_buffer=30, 
+        match_thresh=0.8, 
+        mot20=False
+    )
     tracker = ByteTracker(args=tracker_args, frame_rate=fps)
     STrack.release_id()
 
-    # MODIFIED: Frame count now starts at 0 for KITTI format
-    frame_count = 0
+    frame_count = 0  # KITTI 格式从 0 开始
     with open(output_txt_path, 'w') as f_out:
         with tqdm(total=total_frames, desc=f"处理 {os.path.basename(input_path)}") as pbar:
             while cap.isOpened():
@@ -115,40 +163,41 @@ def process_video_for_eval(input_path, output_txt_path):
                         score = box.conf[0].item()
                         cls_id = box.cls[0].item()
 
-                        roi_w, roi_h = int((x2 - x1) * 0.25), int((y2 - y1) * 0.25)
-                        roi_x1, roi_y1 = x1 + ((x2 - x1) - roi_w) // 2, y1 + ((y2 - y1) - roi_h) // 2
-                        depth_roi = pred_depth_filtered[roi_y1:roi_y1 + roi_h, roi_x1:roi_x1 + roi_w]
+                        # 计算 ROI（避免超出图像边界）
+                        roi_w = max(1, int((x2 - x1) * 0.25))
+                        roi_h = max(1, int((y2 - y1) * 0.25))
+                        roi_x1 = max(0, x1 + ((x2 - x1) - roi_w) // 2)
+                        roi_y1 = max(0, y1 + ((y2 - y1) - roi_h) // 2)
+                        roi_x2 = min(width, roi_x1 + roi_w)
+                        roi_y2 = min(height, roi_y1 + roi_h)
+                        
+                        depth_roi = pred_depth_filtered[roi_y1:roi_y2, roi_x1:roi_x2]
                         initial_depth = np.median(depth_roi) if depth_roi.size > 0 else 0.0
                         detections_with_depth.append([x1, y1, x2, y2, score, cls_id, initial_depth])
 
                 # d. 更新跟踪器
-                # The output format is [x1, y1, x2, y2, track_id, score, class_id, depth]
                 tracks = tracker.update(np.array(detections_with_depth)) if len(
                     detections_with_depth) > 0 else np.empty((0, 8))
 
-                # ========================================================================
-                # MODIFIED: Write results in the requested KITTI tracking format
-                # ========================================================================
+                # e. 写入 KITTI 格式结果
                 if tracks.shape[0] > 0:
                     for track in tracks:
                         bb_left, bb_top, bb_right, bb_bottom = track[0], track[1], track[2], track[3]
                         track_id = int(track[4])
                         score = track[5]
 
-                        # Write the 17-column KITTI format string
+                        # KITTI 17列格式：frame, track_id, class, -1, -1, -10, x1, y1, x2, y2, -1, -1, -1, -1000, -1000, -1000, -10, score
                         f_out.write(
                             f"{frame_count} {track_id} {TARGET_CLASS_NAME} -1 -1 -10 "
                             f"{bb_left:.2f} {bb_top:.2f} {bb_right:.2f} {bb_bottom:.2f} "
                             f"-1 -1 -1 -1000 -1000 -1000 -10 {score:.4f}\n"
                         )
 
-                # MODIFIED: Increment frame count at the end of the loop
                 frame_count += 1
                 pbar.update(1)
 
     cap.release()
     print(f"--- 处理完成！输出已保存至: {output_txt_path} ---")
-
 
 # ==============================================================================
 # 5. 批量处理主程序
@@ -158,8 +207,13 @@ if __name__ == '__main__':
 
     video_files = glob.glob(os.path.join(INPUT_VIDEOS_DIR, '*.mp4'))
     if not video_files:
-        # Note: The error log showed kitti_videos, but doc specified input_videos. Double-check your path.
         print(f"!!! [WARNING] 在目录 {INPUT_VIDEOS_DIR} 中未找到任何 .mp4 视频文件。")
+        print(">>> [DEBUG] 检查目录下的文件：")
+        if os.path.exists(INPUT_VIDEOS_DIR):
+            for file in os.listdir(INPUT_VIDEOS_DIR):
+                print(f"  - {file}")
+        else:
+            print(f"  目录 {INPUT_VIDEOS_DIR} 不存在")
     else:
         print(f">>> [INFO] 找到 {len(video_files)} 个视频文件进行处理。")
 
@@ -174,7 +228,6 @@ if __name__ == '__main__':
         except Exception as e:
             print(f"!!! [FATAL ERROR] 处理视频 {video_path} 时发生严重错误: {e}")
             import traceback
-
             traceback.print_exc()
             continue
 

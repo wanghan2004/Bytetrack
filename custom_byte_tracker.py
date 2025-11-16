@@ -10,6 +10,7 @@ from ultralytics.trackers.utils import matching
 check_requirements('lap')
 import lap
 
+# ... (motion_mahalanobis_distance 和 mahalanobis_distance_depth 保持不变) ...
 def motion_mahalanobis_distance(tracks, detections):
     """计算航迹和检测框之间的2D运动(xyah)马氏距离"""
     cost_matrix = np.full((len(tracks), len(detections)), np.inf, dtype=np.float32)
@@ -54,37 +55,44 @@ def mahalanobis_distance_depth(tracks, detections):
             cost_matrix[i, j] = maha_dist_sq
     return cost_matrix
 
+
 class STrack(BaseTrack):
     shared_kalman = KalmanFilterXYAH()
 
-    def __init__(self, tlwh, score, cls, initial_depth=0.0):
+    # [修改] 构造函数接收 KF 参数
+    def __init__(self, tlwh, score, cls, initial_depth=0.0, 
+                 kf_R=5.0, kf_Q_pos=0.1, kf_Q_vel=0.01):
         super().__init__()
         self._tlwh = np.asarray(tlwh, dtype=float)
         self.kalman_filter = None; self.mean, self.covariance = None, None
         self.is_activated = False; self.score = score
         self.tracklet_len = 0; self.cls = cls; self.idx = 0
         self.depth = initial_depth
-        self.kf_depth = self.init_depth_kalman_filter(initial_depth)
+        # [修改] 将 KF 参数传递给初始化函数
+        self.kf_depth = self.init_depth_kalman_filter(initial_depth, kf_R, kf_Q_pos, kf_Q_vel)
         self.angle = None
     
-    # ======================== 新增的方法 ========================
+    # ... (release_id 和 xyxy 保持不变) ...
     @staticmethod
     def release_id():
         """
         重置父类 BaseTrack 的ID计数器，确保每个视频的ID从1开始。
         """
         BaseTrack._count = 0
-    # ==========================================================
 
     @property
     def xyxy(self): return self.tlbr
 
-    def init_depth_kalman_filter(self, initial_depth):
+    # [修改] 初始化函数接收 KF 参数
+    def init_depth_kalman_filter(self, initial_depth, kf_R, kf_Q_pos, kf_Q_vel):
         kf = FilterPyKalmanFilter(dim_x=2, dim_z=1); kf.x = np.array([initial_depth, 0.])
         kf.F = np.array([[1., 1.], [0., 1.]]); kf.H = np.array([[1., 0.]]); kf.P *= 100.
-        kf.R = np.array([[5.]]); kf.Q = np.diag([0.1, 0.01])
+        # [修改] 使用传入的参数，而不是硬编码
+        kf.R = np.array([[kf_R]])
+        kf.Q = np.diag([kf_Q_pos, kf_Q_vel])
         return kf
 
+    # ... (predict, multi_predict, activate, re_activate, update, tlwh, tlbr, ... 保持不变) ...
     def predict(self):
         mean_state = self.mean.copy()
         if self.state != TrackState.Tracked: mean_state[6] = 0
@@ -155,16 +163,26 @@ class STrack(BaseTrack):
     def __repr__(self):
         return f'OT_{self.track_id}_({self.start_frame}-{self.end_frame})'
 
+
 class ByteTracker:
+    # [修改] 构造函数现在只接收 'args'
     def __init__(self, args, frame_rate=30):
         self.tracked_stracks = []; self.lost_stracks = []; self.removed_stracks = []
-        self.frame_id = 0; self.args = args
-        self.track_high_thresh = args.track_high_thresh; self.track_low_thresh = args.track_low_thresh
+        self.frame_id = 0
+        self.args = args
+        
+        # [修改] 所有参数都从 args 中读取
+        self.track_high_thresh = args.track_high_thresh
+        self.track_low_thresh = args.track_low_thresh
         self.new_track_thresh = args.new_track_thresh
-        self.buffer_size = int(frame_rate / 30.0 * args.track_buffer); self.max_time_lost = self.buffer_size
+        
+        self.buffer_size = int(frame_rate / 30.0 * args.track_buffer)
+        self.max_time_lost = self.buffer_size
         self.kalman_filter = KalmanFilterXYAH()
-        self.maha_thresh = 8
-        self.motion_maha_thresh = 7.779
+        
+        # [修改] 从 args 中读取 maha 阈值
+        self.maha_thresh = args.maha_thresh
+        self.motion_maha_thresh = args.motion_maha_thresh
 
     def update(self, results, img=None):
         self.frame_id += 1
@@ -178,7 +196,12 @@ class ByteTracker:
         scores_low=scores[inds_low]; classes_high=classes[remain_inds]; classes_low=classes[inds_low]
         depths_high=depths[remain_inds]; depths_low=depths[inds_low]
         
-        detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s, c, d) for (tlbr, s, c, d) in zip(dets, scores_high, classes_high, depths_high)] if len(dets) > 0 else []
+        # [修改] 创建 STrack 实例时传递 KF 参数
+        detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s, c, d,
+                             kf_R=self.args.depth_kf_R, 
+                             kf_Q_pos=self.args.depth_kf_Q_pos, 
+                             kf_Q_vel=self.args.depth_kf_Q_vel)
+                      for (tlbr, s, c, d) in zip(dets, scores_high, classes_high, depths_high)] if len(dets) > 0 else []
         
         unconfirmed = []; tracked_stracks = []
         for track in self.tracked_stracks:
@@ -206,7 +229,8 @@ class ByteTracker:
             
             for i, track in enumerate(unmatched_tracks_after_iou):
                 innovation_cov = track.kf_depth.P[0, 0] + track.kf_depth.R[0, 0]
-                depth_gate_threshold = 3.0 * np.sqrt(innovation_cov)
+                # [修改] 使用来自 args 的 depth_gate_factor
+                depth_gate_threshold = self.args.depth_gate_factor * np.sqrt(innovation_cov)
                 predicted_depth = track.kf_depth.x[0]
 
                 for j, det in enumerate(unmatched_detections_after_iou):
@@ -216,6 +240,7 @@ class ByteTracker:
                     if abs(predicted_depth - det.depth) > depth_gate_threshold:
                         maha_dists[i, j] = np.inf
             
+            # [修改] 此处使用 self.maha_thresh (在 __init__ 中从 args 设置)
             matches_2, u_track_idx_2, u_detection_idx_2 = matching.linear_assignment(maha_dists, thresh=self.maha_thresh)
             
             for itracked, idet in matches_2:
@@ -229,9 +254,16 @@ class ByteTracker:
             r_tracked_stracks = [t for t in unmatched_tracks_after_iou if t.state == TrackState.Tracked]
             detections_after_depth = unmatched_detections_after_iou
             
-        detections_low = [STrack(STrack.tlbr_to_tlwh(tlbr), s, c, d) for (tlbr, s, c, d) in zip(dets_low, scores_low, classes_low, depths_low)]
+        # [修改] 创建 STrack 实例时传递 KF 参数
+        detections_low = [STrack(STrack.tlbr_to_tlwh(tlbr), s, c, d,
+                                 kf_R=self.args.depth_kf_R, 
+                                 kf_Q_pos=self.args.depth_kf_Q_pos, 
+                                 kf_Q_vel=self.args.depth_kf_Q_vel)
+                          for (tlbr, s, c, d) in zip(dets_low, scores_low, classes_low, depths_low)]
+        
         dists = matching.iou_distance(r_tracked_stracks, detections_low)
-        matches, u_track_low_idx, u_detection_low_idx = matching.linear_assignment(dists, thresh=0.5)
+        # [修改] 使用来自 args 的 second_match_thresh
+        matches, u_track_low_idx, u_detection_low_idx = matching.linear_assignment(dists, thresh=self.args.second_match_thresh)
         
         for itracked, idet in matches:
             track=r_tracked_stracks[itracked]; det=detections_low[idet]
@@ -244,7 +276,8 @@ class ByteTracker:
             
         dists = matching.iou_distance(unconfirmed, detections_after_depth)
         if not self.args.mot20: dists = matching.fuse_score(dists, detections_after_depth)
-        matches, u_unconfirmed_idx, u_detection_final_idx = matching.linear_assignment(dists, thresh=0.7)
+        # [修改] 使用来自 args 的 third_match_thresh
+        matches, u_unconfirmed_idx, u_detection_final_idx = matching.linear_assignment(dists, thresh=self.args.third_match_thresh)
         
         for itracked, idet in matches:
             unconfirmed[itracked].update(detections_after_depth[idet], self.frame_id); activated_stracks.append(unconfirmed[itracked])
@@ -278,6 +311,7 @@ class ByteTracker:
         if len(outputs) > 0: return np.stack(outputs)
         else: return np.empty((0, 8))
 
+# ... (joint_stracks, sub_stracks, remove_duplicate_stracks 保持不变) ...
 def joint_stracks(tlista, tlistb):
     exists = {}; res = []
     for t in tlista: exists[t.track_id] = 1; res.append(t)
